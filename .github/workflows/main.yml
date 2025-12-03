@@ -1,10 +1,10 @@
-name: Build HyperOS SGSI for Poco F3 (Main Branch)
+name: Build HyperOS SGSI for Poco F3 (Fixed Structure)
 
 on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: 'Прямая ссылка на Recovery ROM HyperOS (Source)'
+        description: 'Прямая ссылка на Recovery ROM HyperOS'
         required: true
         default: ''
 
@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1. Очистка места (Ручная)
+      # 1. Очистка места
       - name: Ручная очистка места
         run: |
           sudo rm -rf /usr/share/dotnet
@@ -27,87 +27,88 @@ jobs:
           sudo apt-get clean
           df -h
 
-      # 2. Установка инструментов (Добавлен erofs-utils)
+      # 2. Установка зависимостей
       - name: Установка инструментов
         run: |
           sudo apt-get update
           sudo apt-get install -y git wget curl unzip tar android-sdk-libsparse-utils e2fsprogs simg2img img2simg python3 python3-pip aria2 brotli erofs-utils
           pip3 install protobuf==3.20.*
 
-      # 3. Настройка SGSI Tool (ИСПРАВЛЕНО: Без указания ветки)
+      # 3. Клонирование (ветка 12 - самая стабильная для этого инструмента, или 11)
+      # Если main пустая или сломана, ветка 12 обычно работает.
       - name: Настройка SGSI Tool
         run: |
-          # Клонируем ветку по умолчанию (обычно main или master)
-          git clone --recurse-submodules https://github.com/Xiaoxindada/SGSI-build-tool.git
+          git clone --recurse-submodules https://github.com/Xiaoxindada/SGSI-build-tool.git -b 12
           sudo chmod -R 777 SGSI-build-tool
 
-      # 4. Скачивание
+      # 4. Скачивание и Подготовка (В паку TMP)
       - name: Скачивание прошивки
         run: |
           cd SGSI-build-tool
-          echo "Скачивание..."
-          aria2c -x16 -s16 -o firmware.zip "${{ github.event.inputs.rom_url }}"
+          # Создаем папку tmp, так требует этот инструмент
+          mkdir -p tmp
+          
+          echo "Скачивание в папку tmp..."
+          # Важно: сохраняем файл внутрь tmp/
+          aria2c -x16 -s16 -o tmp/firmware.zip "${{ github.event.inputs.rom_url }}"
 
-      # 5. Сборка (Unpack + Make)
+      # 5. Сборка (Правильный запуск)
       - name: Сборка SGSI
         run: |
           cd SGSI-build-tool
-          ./unpack.sh firmware.zip
           
-          # Собираем образ.
-          sudo ./make.sh AB
+          # Запускаем setup.sh если он есть (установка локальных зависимостей)
+          if [ -f "setup.sh" ]; then
+             sudo bash setup.sh
+          fi
 
-      # 6. ПАТЧИНГ ДЛЯ ЗАПУСКА НА ALIOTH (POCO F3)
+          echo "Начинаем сборку..."
+          # В этом инструменте не нужен unpack.sh, make.sh сам ищет zip в папке tmp
+          # AB - тип разделов для Poco F3
+          sudo bash make.sh AB
+
+      # 6. ПАТЧИНГ
       - name: Патчинг образа
         run: |
           cd SGSI-build-tool
           mkdir -p mount_point
           
-          # Ищем файл (он может называться по-разному)
-          IMG_FILE=$(find . -maxdepth 2 -name "*system*.img" | head -n 1)
+          # Ищем образ в папке SGSI (туда инструмент кладет результат) или в корне
+          IMG_FILE=$(find . -name "*system*.img" | grep -v "mount_point" | head -n 1)
           
           if [ ! -f "$IMG_FILE" ]; then
-            echo "ОШИБКА: Файл образа не найден! Проверь логи шага сборки."
+            echo "ОШИБКА: Образ не найден. Список файлов:"
             ls -R
             exit 1
           fi
           echo "Работаем с файлом: $IMG_FILE"
 
-          # Если образ sparse, разжимаем его
+          # Если sparse - конвертируем
           if file "$IMG_FILE" | grep -q "Android sparse image"; then
              simg2img "$IMG_FILE" system_raw.img
              rm "$IMG_FILE"
              mv system_raw.img "$IMG_FILE"
           fi
 
-          # Монтируем
           sudo mount -o loop,rw "$IMG_FILE" mount_point
           
-          echo ">>> [FIX 1] Отключение Secure Boot и включение ADB"
+          echo ">>> [FIX 1] Отключение Secure Boot"
           sudo sed -i 's/ro.secure=1/ro.secure=0/g' mount_point/system/build.prop || true
           sudo sed -i 's/ro.adb.secure=1/ro.adb.secure=0/g' mount_point/system/build.prop || true
           sudo sed -i 's/ro.debuggable=0/ro.debuggable=1/g' mount_point/system/build.prop || true
           
-          echo ">>> [FIX 2] Удаление 'чужих' оверлеев (Camera, Notch)"
-          # Это критично, чтобы интерфейс не крашился
+          echo ">>> [FIX 2] Удаление оверлеев"
           sudo rm -rf mount_point/product/overlay/DeviceConfig*.apk || true
-          sudo rm -rf mount_point/product/overlay/*MiuiSystemUI*.apk || true
           
-          echo ">>> [FIX 3] Отключение шифрования в fstab"
-          # Ищем fstab в разных местах
+          echo ">>> [FIX 3] Fstab"
           FSTAB_FILE=$(find mount_point/system -name "fstab*" | head -n 1)
           if [ -f "$FSTAB_FILE" ]; then
-             echo "Патчим fstab: $FSTAB_FILE"
              sudo sed -i 's/,fileencryption=aes-256-xts:aes-256-cts:v2//g' "$FSTAB_FILE"
              sudo sed -i 's/,avb//g' "$FSTAB_FILE"
              sudo sed -i 's/forceencrypt//g' "$FSTAB_FILE"
              sudo sed -i 's/dm-verity//g' "$FSTAB_FILE"
           fi
           
-          echo ">>> [FIX 4] Удаление проблемных сервисов"
-          sudo rm -rf mount_point/system/app/MiTrustService || true
-          
-          # Размонтирование и сжатие
           sudo umount mount_point
           img2simg "$IMG_FILE" system_patched.img
           rm "$IMG_FILE"
