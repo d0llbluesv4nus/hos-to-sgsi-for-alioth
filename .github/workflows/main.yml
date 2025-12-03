@@ -1,4 +1,4 @@
-name: Build HyperOS SGSI (Fix Protobuf)
+name: Build HyperOS SGSI (Fix LZMA)
 
 on:
   workflow_dispatch:
@@ -27,31 +27,29 @@ jobs:
           sudo apt-get clean
           df -h
 
-      # 2. Установка Python 2 и Protobuf (ИСПРАВЛЕНО)
+      # 2. Установка Python 2 и Зависимостей (ИСПРАВЛЕНО)
       - name: Установка окружения Python 2.7
         run: |
           sudo apt-get update
-          # Ставим Python 2
-          sudo apt-get install -y python2
+          # Ставим Python 2 и библиотеку для компиляции lzma
+          sudo apt-get install -y python2 liblzma-dev
           
-          # Скачиваем установщик pip для старого Python 2.7
+          # Скачиваем pip
           curl https://bootstrap.pypa.io/pip/2.7/get-pip.py --output get-pip.py
-          
-          # Устанавливаем pip глобально (через sudo)
           sudo python2 get-pip.py
           
-          # Устанавливаем protobuf версии 3.17.3 (последняя для Python 2) ГЛОБАЛЬНО
-          # Использование `sudo python2 -m pip` гарантирует, что библиотека встанет в /usr/local/lib
-          sudo python2 -m pip install protobuf==3.17.3
+          # Устанавливаем зависимости ГЛОБАЛЬНО
+          # Добавили backports.lzma для поддержки lzma в Python 2
+          sudo python2 -m pip install protobuf==3.17.3 backports.lzma
           
-          # Делаем симлинк, чтобы команда 'python' вызывала 'python2'
+          # Симлинк
           sudo ln -sf /usr/bin/python2 /usr/bin/python
           
-          # Проверяем, видит ли питон библиотеку (должно вывести путь, а не ошибку)
-          echo "Проверка библиотеки Protobuf:"
-          python2 -c "import google.protobuf; print google.protobuf.__file__"
+          # Проверка
+          echo "Проверка LZMA:"
+          python2 -c "from backports import lzma; print lzma.__file__"
 
-      # 3. Установка остальных инструментов
+      # 3. Установка инструментов
       - name: Установка системных инструментов
         run: |
           sudo apt-get install -y git wget curl unzip tar zip android-sdk-libsparse-utils e2fsprogs simg2img img2simg aria2 brotli erofs-utils
@@ -83,7 +81,6 @@ jobs:
           cd SGSI-build-tool
           mkdir -p mount_point
           
-          # Ищем файл
           IMG_FILE=$(find . -name "*system*.img" | grep -v "mount_point" | head -n 1)
           
           if [ ! -f "$IMG_FILE" ]; then
@@ -119,7 +116,7 @@ jobs:
           img2simg "$IMG_FILE" system_patched.img
           rm "$IMG_FILE"
 
-      # 8. Упаковка и Релиз
+      # 8. Релиз
       - name: Упаковка и Релиз
         uses: softprops/action-gh-release@v1
         if: success()
@@ -129,7 +126,7 @@ jobs:
           name: HyperOS Port Build ${{ github.run_number }}
           body: |
             HyperOS Port for Poco F3 (Alioth).
-            **ВНИМАНИЕ:** Файл .img загружен напрямую (без zip), так как GitHub может сжимать его сам.
+            **ВНИМАНИЕ:** Файл .img загружен напрямую.
             Source: ${{ github.event.inputs.rom_url }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
