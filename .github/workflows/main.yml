@@ -1,0 +1,121 @@
+name: Build HyperOS SGSI for Poco F3
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: 'Прямая ссылка на Recovery ROM HyperOS (Source Device)'
+        required: true
+        default: ''
+      os_type:
+        description: 'Версия Android (14 или 15)'
+        required: true
+        default: '14'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Освобождение места (Cleanup)
+        uses: rokibhasan12/Remove-Android-Software-Action@v1
+
+      - name: Установка зависимостей
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget curl unzip tar android-sdk-libsparse-utils e2fsprogs simg2img img2simg python3 python3-pip aria2 brotli
+          # Установка инструментов для работы с разделами
+          pip3 install protobuf==3.20.*
+
+      - name: Настройка SGSI Tool (Xiaoxindada)
+        run: |
+          git clone --recurse-submodules https://github.com/Xiaoxindada/SGSI-build-tool.git -b 15
+          # Ветка 15 обычно поддерживает A14 и A15
+          sudo chmod -R 777 SGSI-build-tool
+
+      - name: Скачивание прошивки
+        run: |
+          cd SGSI-build-tool
+          echo "Скачивание прошивки..."
+          aria2c -x16 -s16 -o firmware.zip "${{ github.event.inputs.rom_url }}"
+          
+      - name: Сборка образа (Build SGSI)
+        run: |
+          cd SGSI-build-tool
+          
+          # 1. Распаковка
+          ./unpack.sh firmware.zip
+          
+          # 2. Основная магия сборки (автоматический патчинг GSI)
+          # A-only false (Alioth это AB устройство, но SGSI часто делают A-only для установки в System)
+          # Но для F3 лучше использовать AB структуру, если тулза позволяет.
+          # В данном инструменте скрипт сам определяет структуру.
+          
+          sudo ./make.sh AB
+          
+      - name: ПРИМЕНЕНИЕ ДОПОЛНИТЕЛЬНЫХ ПАТЧЕЙ (Custom Alioth Fixes)
+        run: |
+          cd SGSI-build-tool
+          # Монтируем полученный образ для ручных правок
+          mkdir -p mount_point
+          
+          # Находим созданный образ (обычно в папке output)
+          IMG_FILE=$(find . -name "*system*.img" | head -n 1)
+          
+          if [ -f "$IMG_FILE" ]; then
+            echo "Образ найден: $IMG_FILE. Начинаем патчинг..."
+            
+            # Конвертация в raw для монтирования (если он sparse)
+            if file "$IMG_FILE" | grep -q "Android sparse image"; then
+                simg2img "$IMG_FILE" system_raw.img
+                rm "$IMG_FILE"
+                mv system_raw.img "$IMG_FILE"
+            fi
+            
+            sudo mount -o loop,rw "$IMG_FILE" mount_point
+            
+            echo ">>> [PATCH 1] Отключение проверки Secure Boot и Debuggable"
+            sudo sed -i 's/ro.secure=1/ro.secure=0/g' mount_point/system/build.prop || true
+            sudo sed -i 's/ro.debuggable=0/ro.debuggable=1/g' mount_point/system/build.prop || true
+            sudo sed -i 's/ro.adb.secure=1/ro.adb.secure=0/g' mount_point/system/build.prop || true
+            
+            echo ">>> [PATCH 2] Удаление конфликтующих оверлеев (частая причина бутлупа на F3)"
+            # Удаляем оверлеи донора, которые перекрывают настройки Alioth
+            sudo rm -rf mount_point/product/overlay/DeviceConfig*.apk || true
+            sudo rm -rf mount_point/product/overlay/*MiuiSystemUI*.apk || true
+            
+            echo ">>> [PATCH 3] Удаление сервисов, вызывающих краш без Play Integrity"
+            # Удаляем MiTrustService и прочее, что может вешать систему при загрузке
+            sudo rm -rf mount_point/system/app/MiTrustService || true
+            sudo rm -rf mount_point/system/priv-app/MiTrustService || true
+            
+            echo ">>> [PATCH 4] Фикс fstab (Отключение принудительного шифрования для первого запуска)"
+            # Обычно SGSI тулза это делает, но перестрахуемся
+            if [ -f mount_point/system/etc/fstab* ]; then
+                sudo sed -i 's/fileencryption//g' mount_point/system/etc/fstab*
+                sudo sed -i 's/forceencrypt//g' mount_point/system/etc/fstab*
+                sudo sed -i 's/dm-verity//g' mount_point/system/etc/fstab*
+            fi
+
+            sudo umount mount_point
+            echo "Патчи применены успешно."
+            
+            # Сжимаем обратно в sparse для уменьшения размера (опционально) или gzip
+            img2simg "$IMG_FILE" system_patched.img
+            rm "$IMG_FILE"
+          else
+            echo "ERROR: System image not found!"
+            exit 1
+          fi
+
+      - name: Упаковка и загрузка
+        uses: actions/upload-artifact@v4
+        with:
+          name: HyperOS-Alioth-Port
+          path: SGSI-build-tool/system_patched.img
+          compression-level: 9
