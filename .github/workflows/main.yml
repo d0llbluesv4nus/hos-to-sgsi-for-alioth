@@ -1,4 +1,4 @@
-name: Build HyperOS SGSI (Fix LZMA)
+name: Build HyperOS SGSI (Fix Headers)
 
 on:
   workflow_dispatch:
@@ -27,19 +27,20 @@ jobs:
           sudo apt-get clean
           df -h
 
-      # 2. Установка Python 2 и Зависимостей (ИСПРАВЛЕНО)
+      # 2. Установка Python 2 и зависимостей (ГЛАВНОЕ ИСПРАВЛЕНИЕ)
       - name: Установка окружения Python 2.7
         run: |
+          sudo add-apt-repository universe
           sudo apt-get update
-          # Ставим Python 2 и библиотеку для компиляции lzma
-          sudo apt-get install -y python2 liblzma-dev
+          
+          # ИСПРАВЛЕНИЕ: Добавлен python2-dev для файла Python.h
+          sudo apt-get install -y python2 python2-dev liblzma-dev
           
           # Скачиваем pip
           curl https://bootstrap.pypa.io/pip/2.7/get-pip.py --output get-pip.py
           sudo python2 get-pip.py
           
-          # Устанавливаем зависимости ГЛОБАЛЬНО
-          # Добавили backports.lzma для поддержки lzma в Python 2
+          # Устанавливаем библиотеки (Теперь компиляция backports.lzma пройдет успешно)
           sudo python2 -m pip install protobuf==3.17.3 backports.lzma
           
           # Симлинк
