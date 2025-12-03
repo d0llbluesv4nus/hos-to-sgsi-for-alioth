@@ -1,4 +1,4 @@
-name: Build HyperOS SGSI & Release (Fixed Python)
+name: Build HyperOS SGSI (Python 2 Fix)
 
 on:
   workflow_dispatch:
@@ -27,20 +27,38 @@ jobs:
           sudo apt-get clean
           df -h
 
-      # 2. Установка зависимостей
-      - name: Установка инструментов
+      # 2. Установка Python 2 (ГЛАВНОЕ ИСПРАВЛЕНИЕ)
+      - name: Установка окружения Python 2.7
         run: |
           sudo apt-get update
-          sudo apt-get install -y git wget curl unzip tar zip android-sdk-libsparse-utils e2fsprogs simg2img img2simg python3 python3-pip aria2 brotli erofs-utils
-          pip3 install protobuf==3.20.*
+          # Устанавливаем Python 2
+          sudo apt-get install -y python2
+          
+          # Устанавливаем pip для Python 2 (так как в репозиториях его уже нет)
+          curl https://bootstrap.pypa.io/pip/2.7/get-pip.py --output get-pip.py
+          sudo python2 get-pip.py
+          
+          # Устанавливаем protobuf для Python 2
+          pip2 install protobuf==3.17.3
+          
+          # ДЕЛАЕМ МАГИЮ: Заставляем команду 'python' запускать 'python2'
+          sudo ln -sf /usr/bin/python2 /usr/bin/python
+          
+          # Проверка версии
+          python --version
 
-      # 3. Клонирование (ветка 12)
+      # 3. Установка остальных инструментов
+      - name: Установка системных инструментов
+        run: |
+          sudo apt-get install -y git wget curl unzip tar zip android-sdk-libsparse-utils e2fsprogs simg2img img2simg aria2 brotli erofs-utils
+
+      # 4. Настройка SGSI Tool (Ветка 12)
       - name: Настройка SGSI Tool
         run: |
           git clone --recurse-submodules https://github.com/Xiaoxindada/SGSI-build-tool.git -b 12
           sudo chmod -R 777 SGSI-build-tool
 
-      # 4. Скачивание
+      # 5. Скачивание
       - name: Скачивание прошивки
         run: |
           cd SGSI-build-tool
@@ -48,39 +66,30 @@ jobs:
           echo "Скачивание в папку tmp..."
           aria2c -x16 -s16 -o tmp/firmware.zip "${{ github.event.inputs.rom_url }}"
 
-      # --- НОВЫЙ ШАГ: ИСПРАВЛЕНИЕ ОШИБКИ 1L ---
-      - name: Фикс кода Python 2 для Python 3
-        run: |
-          cd SGSI-build-tool
-          echo "Исправление синтаксиса Python..."
-          # Находим все python файлы и заменяем устаревший синтаксис '1L' на '1'
-          find . -name "*.py" -type f -exec sed -i 's/1L/1/g' {} +
-          # На случай, если есть ошибки с print "..." (превращаем в функцию)
-          find . -name "*.py" -type f -exec sed -i 's/print /print(/g' {} +
-          # (Грубый фикс принтов, но часто спасает, если скрипт простой)
-
-      # 5. Сборка
+      # 6. Сборка (Теперь должна работать без ошибок синтаксиса)
       - name: Сборка SGSI
         run: |
           cd SGSI-build-tool
-          sudo bash setup.sh
-          echo "Начинаем сборку..."
-          # Добавляем флаг --fix-bug
+          # Setup может пытаться ставить пакеты через apt, но у нас уже все стоит
+          # Запускаем сборку
+          echo "Запуск make.sh..."
           sudo bash make.sh --AB 14 tmp/firmware.zip --fix-bug
 
-      # 6. ПАТЧИНГ
-      - name: Патчинг образа
+      # 7. ПАТЧИНГ (Alioth Specific)
+      - name: Патчинг образа для Poco F3
         run: |
           cd SGSI-build-tool
           mkdir -p mount_point
           
+          # Ищем файл
           IMG_FILE=$(find . -name "*system*.img" | grep -v "mount_point" | head -n 1)
           
           if [ ! -f "$IMG_FILE" ]; then
-            echo "ОШИБКА: Образ не найден! Скрипт распаковки упал."
+            echo "ОШИБКА: Образ не найден! Сборка не удалась."
             exit 1
           fi
 
+          # Конвертация sparse -> raw
           if file "$IMG_FILE" | grep -q "Android sparse image"; then
              simg2img "$IMG_FILE" system_raw.img
              rm "$IMG_FILE"
@@ -90,13 +99,16 @@ jobs:
           sudo mount -o loop,rw "$IMG_FILE" mount_point
           
           echo ">>> Применение патчей..."
+          # Boot fixes
           sudo sed -i 's/ro.secure=1/ro.secure=0/g' mount_point/system/build.prop || true
           sudo sed -i 's/ro.adb.secure=1/ro.adb.secure=0/g' mount_point/system/build.prop || true
           sudo sed -i 's/ro.debuggable=0/ro.debuggable=1/g' mount_point/system/build.prop || true
-          # Удаление оверлеев
+          
+          # Overlay removal
           sudo rm -rf mount_point/product/overlay/DeviceConfig*.apk || true
           sudo rm -rf mount_point/product/overlay/*MiuiSystemUI*.apk || true
           
+          # Encryption disable
           FSTAB_FILE=$(find mount_point/system -name "fstab*" | head -n 1)
           if [ -f "$FSTAB_FILE" ]; then
              sudo sed -i 's/,fileencryption=aes-256-xts:aes-256-cts:v2//g' "$FSTAB_FILE"
@@ -109,7 +121,7 @@ jobs:
           img2simg "$IMG_FILE" system_patched.img
           rm "$IMG_FILE"
 
-      # 7. Упаковка ZIP
+      # 8. Упаковка
       - name: Упаковка в ZIP
         run: |
           cd SGSI-build-tool
@@ -117,7 +129,7 @@ jobs:
           zip -r "$ZIP_NAME" system_patched.img
           echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
 
-      # 8. Релиз
+      # 9. Релиз
       - name: Загрузка в Releases
         uses: softprops/action-gh-release@v1
         with:
