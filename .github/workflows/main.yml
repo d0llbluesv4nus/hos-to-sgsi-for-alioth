@@ -1,177 +1,102 @@
-name: HOS to SGSI for Alioth (Fixed & Updated)
+name: HyperOS to SGSI (Alioth)
 
 on:
   workflow_dispatch:
     inputs:
-      rom_url:
-        description: 'Прямая ссылка на Recovery ROM (.zip) HyperOS/MIUI'
+      ROM_URL:
+        description: 'Ссылка на Recovery (zip) или Fastboot (tgz) прошивку HyperOS'
         required: true
-        default: ''
-      os_type:
-        description: 'Тип системы (ab - для большинства современных, a - для старых)'
+      OS_TYPE:
+        description: 'Тип разметки (для Alioth выбирай AB)'
         required: true
         default: 'ab'
+        type: choice
+        options:
+        - ab
+        - a
+      REPACK_NAME:
+        description: 'Имя выходного файла'
+        required: true
+        default: 'HyperOS_SGSI'
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-
+    runs-on: ubuntu-20.04 # 20.04 самая надежная для сборки GSI
+    
     steps:
-      - name: 🗑️ Очистка места (Free Disk Space)
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          sudo docker image prune --all --force
-          sudo apt-get clean
-          df -h
+      - name: Checkout
+        uses: actions/checkout@v3
 
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      # 1. ОЧИСТКА МЕСТА (Для HyperOS это ОБЯЗАТЕЛЬНО, она весит >5ГБ в архиве)
+      - name: Cleanup Disk Space
+        uses: rokibhasansagar/slimhub_actions@main
+        with:
+          retain: "podman,docker_buildx"
 
-      - name: ⚙️ Установка зависимостей
+      # 2. УСТАНОВКА ИНСТРУМЕНТОВ
+      - name: Install Tools & Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git wget zip unzip curl axel python3 python3-pip openjdk-11-jdk
-          sudo apt-get install -y android-sdk-libsparse-utils e2fsprogs simg2img img2simg p7zip-full
-          # Установка erofs-utils для работы с образами HyperOS
-          sudo apt-get install -y erofs-utils
-          pip3 install protobuf
+          sudo apt-get -y install git unzip zip curl wget python3 python3-pip aria2 zstd
+          sudo apt-get -y install android-sdk-libsparse-utils # simg2img для fastboot ромов
+          sudo apt-get -y install openjdk-8-jdk
+          
+          # Специфично для HyperOS (работа с EROFS)
+          sudo apt-get -y install erofs-utils
+          
+          # Python зависимости
+          pip3 install --upgrade pip
+          pip3 install protobuf requests docopt
 
-      - name: ⬇️ Скачивание инструментов (Xiaoxindada & Payload Dumper)
+      # 3. НАСТРОЙКА ИНСТРУМЕНТА СБОРКИ (Xiaoxindada - лучший для MIUI/HyperOS)
+      - name: Setup SGSI Tool
         run: |
-          # Клонируем SGSI tool
-          git clone --recurse-submodules https://github.com/xiaoxindada/sgsi-build-tool.git tool
+          git clone --recurse-submodules https://github.com/Xiaoxindada/SGSI-Build-Tool.git tool
           sudo chmod -R 777 tool
           
-          # Скачиваем payload-dumper-go
-          wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
-          tar -xvf payload-dumper-go_1.2.2_linux_amd64.tar.gz
-          sudo mv payload-dumper-go /usr/local/bin/
-          rm payload-dumper-go_1.2.2_linux_amd64.tar.gz
-
-      - name: ⬇️ Скачивание и распаковка прошивки
+      # 4. СКАЧИВАНИЕ ПРОШИВКИ
+      - name: Download HyperOS Firmware
+        working-directory: ./tool
         run: |
-          cd tool
-          echo "Скачиваем ROM..."
-          axel -n 16 "${{ github.event.inputs.rom_url }}" -o firmware.zip || wget -O firmware.zip "${{ github.event.inputs.rom_url }}"
-          
-          echo "Распаковка архива..."
-          unzip firmware.zip -d firmware_extracted
-          
-          if [ -f "firmware_extracted/payload.bin" ]; then
-            echo "Найден payload.bin. Извлекаем system.img..."
-            payload-dumper-go -p system -o . firmware_extracted/payload.bin
-            # Перемещаем извлеченный файл в корень папки tool
-            mv system.img system_orig.img
+          echo "Downloading: ${{ inputs.ROM_URL }}"
+          # Используем aria2c для скорости
+          aria2c -x16 -s16 -o firmware.zip "${{ inputs.ROM_URL }}"
+          ls -lh firmware.zip
+
+      # 5. СБОРКА SGSI
+      - name: Build SGSI
+        working-directory: ./tool
+        run: |
+          # Запуск скрипта. 
+          # --fix-bug включает фиксы для китайских прошивок
+          # Скрипт сам определит, payload.bin это или fastboot images
+          sudo bash ./make.sh --url firmware.zip --type ${{ inputs.OS_TYPE }} --fix-bug
+
+      # 6. ПРОВЕРКА И УПАКОВКА
+      - name: Repack Output
+        working-directory: ./tool
+        run: |
+          if ls SGSI/*.img 1> /dev/null 2>&1; then
+            echo "Build Success! Packing..."
+            cd SGSI
+            # HyperOS образы большие, сжимаем сильно
+            7z a -t7z -m0=lzma2 -mx=9 -mfb=64 -md=32m -ms=on ${{ inputs.REPACK_NAME }}.7z *.img
+            mv ${{ inputs.REPACK_NAME }}.7z ../
           else
-            echo "❌ Ошибка: payload.bin не найден! Скрипт поддерживает только новые ROM."
+            echo "::error::Build failed! No .img file found inside SGSI folder."
+            ls -R
             exit 1
           fi
 
-      - name: 🔄 Конвертация EROFS в EXT4 (HyperOS Fix)
-        run: |
-          cd tool
-          # Проверяем magic bytes, является ли файл EROFS
-          MAGIC=$(head -c 4 system_orig.img | xxd -p)
-          
-          if [[ "$MAGIC" == "e2e1f5e0" ]]; then
-            echo "⚠️ Обнаружен формат EROFS. Начинаем конвертацию в EXT4..."
-            
-            # Создаем пустой образ ext4 (размер берем с запасом, например 5GB, или вычисляем)
-            # HyperOS system обычно весит 3-4GB, делаем 6GB для надежности
-            dd if=/dev/zero of=system.img bs=1M count=6144
-            mkfs.ext4 system.img
-            
-            # Монтируем EROFS и новый EXT4
-            mkdir -p mnt_erofs mnt_ext4
-            sudo mount -t erofs -o loop system_orig.img mnt_erofs
-            sudo mount -t ext4 -o loop,rw system.img mnt_ext4
-            
-            echo "Копирование файлов..."
-            sudo cp -a mnt_erofs/* mnt_ext4/
-            
-            echo "Размонтирование..."
-            sudo umount mnt_erofs
-            sudo umount mnt_ext4
-            
-            # Удаляем оригинал для экономии места
-            rm system_orig.img
-            echo "✅ Конвертация завершена. system.img теперь EXT4."
-          else
-            echo "ℹ️ Формат не EROFS (или уже raw/sparse). Используем как есть."
-            mv system_orig.img system.img
-          fi
-          
-          # На всякий случай делаем simg2img, если вдруг это sparse ext4, а не raw
-          if file system.img | grep -q "sparse"; then
-             echo "Конвертация Sparse -> Raw..."
-             simg2img system.img system_raw.img
-             mv system_raw.img system.img
-          fi
-
-      - name: 🛠️ Сборка SGSI
-        run: |
-          cd tool
-          echo "Запуск make.sh..."
-          # Запускаем сборку. Важно: скрипт может требовать sudo для монтирования
-          sudo ./make.sh --${{ github.event.inputs.os_type }} system.img
-          
-          if [ ! -f "SGSI.img" ]; then
-             echo "❌ Ошибка: SGSI.img не был создан. Проверьте логи сборки."
-             exit 1
-          fi
-          echo "✅ Базовая сборка завершена."
-
-      - name: 🔧 ПАТЧИНГ (Alioth Specific & Cleanup)
-        run: |
-          cd tool
-          
-          # Убедимся, что SGSI.img это raw image для монтирования
-          if file SGSI.img | grep -q "sparse"; then
-            simg2img SGSI.img SGSI_raw.img
-            mv SGSI_raw.img SGSI.img
-          fi
-
-          # Расширяем образ перед монтированием
-          e2fsck -f -y SGSI.img
-          resize2fs SGSI.img 5000M || true
-
-          mkdir -p mount_point
-          sudo mount -t ext4 -o loop,rw SGSI.img mount_point
-          
-          echo ">>> Удаление Bloatware (MiVideo, MiMusic)..."
-          sudo rm -rf mount_point/system/app/MiVideo
-          sudo rm -rf mount_point/system/app/MiMusic
-          sudo rm -rf mount_point/system/priv-app/MiBrowserGlobal
-          
-          echo ">>> Применение Build.prop твиков для Alioth..."
-          # Используем >> для добавления или sed для замены. Sed безопаснее если строки уже есть.
-          sudo sed -i 's/^ro.product.model=.*/ro.product.model=M2012K11AC/' mount_point/system/build.prop || echo "ro.product.model=M2012K11AC" | sudo tee -a mount_point/system/build.prop
-          sudo sed -i 's/^ro.product.brand=.*/ro.product.brand=POCO/' mount_point/system/build.prop || echo "ro.product.brand=POCO" | sudo tee -a mount_point/system/build.prop
-          sudo sed -i 's/^ro.product.name=.*/ro.product.name=alioth/' mount_point/system/build.prop || echo "ro.product.name=alioth" | sudo tee -a mount_point/system/build.prop
-          sudo sed -i 's/^ro.product.device=.*/ro.product.device=alioth/' mount_point/system/build.prop || echo "ro.product.device=alioth" | sudo tee -a mount_point/system/build.prop
-
-          echo ">>> Фикс RW (если возможен)..."
-          if [ -f "mount_point/system/etc/fstab.qcom" ]; then
-             sudo sed -i 's/,ro/,rw/g' mount_point/system/etc/fstab.qcom
-          fi
-          
-          # Очистка lost+found для красоты
-          sudo rm -rf mount_point/lost+found
-
-          sudo umount mount_point
-          
-          echo ">>> Оптимизация размера (Shrink)..."
-          resize2fs -M SGSI.img
-          
-          echo ">>> Конвертация в Sparse (для fastboot)..."
-          img2simg SGSI.img SGSI_Alioth_Patched.img
-          rm SGSI.img
-
-      - name: 📤 Загрузка результата
-        uses: actions/upload-artifact@v4
+      # 7. ЗАГРУЗКА РЕЛИЗА
+      - name: Upload to Github Releases
+        uses: ncipollo/release-action@v1
         with:
-          name: HOS_SGSI_Alioth
-          path: tool/SGSI_Alioth_Patched.img
+          artifacts: "tool/${{ inputs.REPACK_NAME }}.7z"
+          tag: "HyperOS_${{ github.run_number }}"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            **HyperOS SGSI Build for Alioth**
+            Source URL: ${{ inputs.ROM_URL }}
+            Partition Type: ${{ inputs.OS_TYPE }}
+            Date: ${{ steps.date.outputs.date }}
