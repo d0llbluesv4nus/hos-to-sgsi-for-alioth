@@ -1,4 +1,4 @@
-name: HOS to SGSI for Alioth (Patched)
+name: HOS to SGSI for Alioth (Fixed & Updated)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         default: ''
       os_type:
-        description: 'Тип системы (ab - для большинства, a - для старых)'
+        description: 'Тип системы (ab - для большинства современных, a - для старых)'
         required: true
         default: 'ab'
 
@@ -17,106 +17,161 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+      - name: 🗑️ Очистка места (Free Disk Space)
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          sudo apt-get clean
+          df -h
+
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Подготовка окружения (Установка утилит)
+      - name: ⚙️ Установка зависимостей
         run: |
           sudo apt-get update
-          sudo apt-get install -y git wget zip unzip curl axel python3 python3-pip android-sdk-libsparse-utils
-          sudo apt-get install -y e2fsprogs simg2img img2simg p7zip-full
+          sudo apt-get install -y git wget zip unzip curl axel python3 python3-pip openjdk-11-jdk
+          sudo apt-get install -y android-sdk-libsparse-utils e2fsprogs simg2img img2simg p7zip-full
+          # Установка erofs-utils для работы с образами HyperOS
+          sudo apt-get install -y erofs-utils
           pip3 install protobuf
-          
-      - name: Скачивание инструментов портирования (Xiaoxindada)
+
+      - name: ⬇️ Скачивание инструментов (Xiaoxindada & Payload Dumper)
         run: |
+          # Клонируем SGSI tool
           git clone --recurse-submodules https://github.com/xiaoxindada/sgsi-build-tool.git tool
           sudo chmod -R 777 tool
           
-      - name: Скачивание прошивки
+          # Скачиваем payload-dumper-go
+          wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          tar -xvf payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          sudo mv payload-dumper-go /usr/local/bin/
+          rm payload-dumper-go_1.2.2_linux_amd64.tar.gz
+
+      - name: ⬇️ Скачивание и распаковка прошивки
         run: |
           cd tool
           echo "Скачиваем ROM..."
-          axel -n 16 "${{ github.event.inputs.rom_url }}" -o firmware.zip
+          axel -n 16 "${{ github.event.inputs.rom_url }}" -o firmware.zip || wget -O firmware.zip "${{ github.event.inputs.rom_url }}"
+          
+          echo "Распаковка архива..."
           unzip firmware.zip -d firmware_extracted
           
-          # Поиск payload.bin или br (brotli)
           if [ -f "firmware_extracted/payload.bin" ]; then
-            echo "Найден payload.bin, распаковываем..."
-            # Установка payload-dumper-go (быстрее чем python)
-            wget https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
-            tar -xvf payload-dumper-go_1.2.2_linux_amd64.tar.gz
-            ./payload-dumper-go -o firmware_extracted/images firmware_extracted/payload.bin
-            mv firmware_extracted/images/system.img .
+            echo "Найден payload.bin. Извлекаем system.img..."
+            payload-dumper-go -p system -o . firmware_extracted/payload.bin
+            # Перемещаем извлеченный файл в корень папки tool
+            mv system.img system_orig.img
           else
-             echo "Payload.bin не найден, ищем system.new.dat.br..."
-             # Логика для старых форматов (если нужно, но HOS обычно в payload)
+            echo "❌ Ошибка: payload.bin не найден! Скрипт поддерживает только новые ROM."
+            exit 1
           fi
 
-      - name: Сборка SGSI (Базовый процесс)
+      - name: 🔄 Конвертация EROFS в EXT4 (HyperOS Fix)
         run: |
           cd tool
-          sudo ./make.sh --${{ github.event.inputs.os_type }} system.img
-          echo "Базовая сборка завершена. Файл SGSI.img готов к патчингу."
+          # Проверяем magic bytes, является ли файл EROFS
+          MAGIC=$(head -c 4 system_orig.img | xxd -p)
+          
+          if [[ "$MAGIC" == "e2e1f5e0" ]]; then
+            echo "⚠️ Обнаружен формат EROFS. Начинаем конвертацию в EXT4..."
+            
+            # Создаем пустой образ ext4 (размер берем с запасом, например 5GB, или вычисляем)
+            # HyperOS system обычно весит 3-4GB, делаем 6GB для надежности
+            dd if=/dev/zero of=system.img bs=1M count=6144
+            mkfs.ext4 system.img
+            
+            # Монтируем EROFS и новый EXT4
+            mkdir -p mnt_erofs mnt_ext4
+            sudo mount -t erofs -o loop system_orig.img mnt_erofs
+            sudo mount -t ext4 -o loop,rw system.img mnt_ext4
+            
+            echo "Копирование файлов..."
+            sudo cp -a mnt_erofs/* mnt_ext4/
+            
+            echo "Размонтирование..."
+            sudo umount mnt_erofs
+            sudo umount mnt_ext4
+            
+            # Удаляем оригинал для экономии места
+            rm system_orig.img
+            echo "✅ Конвертация завершена. system.img теперь EXT4."
+          else
+            echo "ℹ️ Формат не EROFS (или уже raw/sparse). Используем как есть."
+            mv system_orig.img system.img
+          fi
+          
+          # На всякий случай делаем simg2img, если вдруг это sparse ext4, а не raw
+          if file system.img | grep -q "sparse"; then
+             echo "Конвертация Sparse -> Raw..."
+             simg2img system.img system_raw.img
+             mv system_raw.img system.img
+          fi
 
-      - name: 🛠️ ПАТЧИНГ (Alioth Specific & General Fixes)
+      - name: 🛠️ Сборка SGSI
+        run: |
+          cd tool
+          echo "Запуск make.sh..."
+          # Запускаем сборку. Важно: скрипт может требовать sudo для монтирования
+          sudo ./make.sh --${{ github.event.inputs.os_type }} system.img
+          
+          if [ ! -f "SGSI.img" ]; then
+             echo "❌ Ошибка: SGSI.img не был создан. Проверьте логи сборки."
+             exit 1
+          fi
+          echo "✅ Базовая сборка завершена."
+
+      - name: 🔧 ПАТЧИНГ (Alioth Specific & Cleanup)
         run: |
           cd tool
           
-          # 1. Конвертируем sparse image в raw, если нужно, чтобы смонтировать
+          # Убедимся, что SGSI.img это raw image для монтирования
           if file SGSI.img | grep -q "sparse"; then
-            simg2img SGSI.img system_raw.img
-            rm SGSI.img
-            mv system_raw.img SGSI.img
+            simg2img SGSI.img SGSI_raw.img
+            mv SGSI_raw.img SGSI.img
           fi
 
-          # 2. Увеличиваем размер образа для внесения изменений (добавляем 200Мб)
-          e2fsck -f SGSI.img
-          resize2fs SGSI.img 4500M || true
+          # Расширяем образ перед монтированием
+          e2fsck -f -y SGSI.img
+          resize2fs SGSI.img 5000M || true
 
-          # 3. Монтируем
           mkdir -p mount_point
-          sudo mount -o loop,rw SGSI.img mount_point
-
-          echo ">>> Применяем патчи..."
-
-          # --- ПАТЧ 1: Debloat (Удаление мусора, чтобы влезло и не тормозило) ---
+          sudo mount -t ext4 -o loop,rw SGSI.img mount_point
+          
+          echo ">>> Удаление Bloatware (MiVideo, MiMusic)..."
           sudo rm -rf mount_point/system/app/MiVideo
           sudo rm -rf mount_point/system/app/MiMusic
           sudo rm -rf mount_point/system/priv-app/MiBrowserGlobal
-          # Можно добавить свои приложения
-
-          # --- ПАТЧ 2: Build.prop (Spoofing под Alioth) ---
-          # Это помогает маркете и некоторым играм определять устройство как POCO F3
-          sudo sed -i 's/ro.product.model=.*/ro.product.model=M2012K11AC/g' mount_point/system/build.prop
-          sudo sed -i 's/ro.product.brand=.*/ro.product.brand=POCO/g' mount_point/system/build.prop
-          sudo sed -i 's/ro.product.name=.*/ro.product.name=alioth/g' mount_point/system/build.prop
-          sudo sed -i 's/ro.product.device=.*/ro.product.device=alioth/g' mount_point/system/build.prop
           
-          # --- ПАТЧ 3: Fix DFPS / Overlays (Если есть URL на зип с оверлеями) ---
-          # Для Alioth часто нужны специфичные оверлеи фреймворка.
-          # Здесь мы качаем универсальный патч, если он существует, или создаем заглушку.
-          # Пример (раскомментировать при наличии реального URL):
-          # wget https://example.com/alioth_overlay.apk
-          # sudo cp alioth_overlay.apk mount_point/system/product/overlay/
+          echo ">>> Применение Build.prop твиков для Alioth..."
+          # Используем >> для добавления или sed для замены. Sed безопаснее если строки уже есть.
+          sudo sed -i 's/^ro.product.model=.*/ro.product.model=M2012K11AC/' mount_point/system/build.prop || echo "ro.product.model=M2012K11AC" | sudo tee -a mount_point/system/build.prop
+          sudo sed -i 's/^ro.product.brand=.*/ro.product.brand=POCO/' mount_point/system/build.prop || echo "ro.product.brand=POCO" | sudo tee -a mount_point/system/build.prop
+          sudo sed -i 's/^ro.product.name=.*/ro.product.name=alioth/' mount_point/system/build.prop || echo "ro.product.name=alioth" | sudo tee -a mount_point/system/build.prop
+          sudo sed -i 's/^ro.product.device=.*/ro.product.device=alioth/' mount_point/system/build.prop || echo "ro.product.device=alioth" | sudo tee -a mount_point/system/build.prop
 
-          # --- ПАТЧ 4: Разрешить запись (RW) в fstab (если файл существует) ---
+          echo ">>> Фикс RW (если возможен)..."
           if [ -f "mount_point/system/etc/fstab.qcom" ]; then
              sudo sed -i 's/,ro/,rw/g' mount_point/system/etc/fstab.qcom
           fi
+          
+          # Очистка lost+found для красоты
+          sudo rm -rf mount_point/lost+found
 
-          echo ">>> Патчинг завершен."
-
-          # 4. Размонтирование и упаковка
           sudo umount mount_point
           
-          # Оптимизация размера образа (shrink)
+          echo ">>> Оптимизация размера (Shrink)..."
           resize2fs -M SGSI.img
           
-          # Конвертация обратно в sparse (для прошивки через fastboot)
-          img2simg SGSI.img SGSI_Patched.img
+          echo ">>> Конвертация в Sparse (для fastboot)..."
+          img2simg SGSI.img SGSI_Alioth_Patched.img
+          rm SGSI.img
 
-      - name: Загрузка результата
+      - name: 📤 Загрузка результата
         uses: actions/upload-artifact@v4
         with:
-          name: HOS_SGSI_Alioth_Patched
-          path: tool/SGSI_Patched.img
+          name: HOS_SGSI_Alioth
+          path: tool/SGSI_Alioth_Patched.img
