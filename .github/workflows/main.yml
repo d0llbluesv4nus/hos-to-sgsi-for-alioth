@@ -1,40 +1,162 @@
-name: Build HyperOS SGSI (Fix Compressor)
+name: Build HyperOS SGSI (Enhanced)
 
 on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: 'Прямая ссылка на Recovery ROM HyperOS'
+        description: 'Прямая ссылка на Recovery ROM (HyperOS/MIUI)'
         required: true
         default: ''
+      android_version:
+        description: 'Версия Android (13, 14, 15)'
+        required: true
+        default: '14'
+      repack_type:
+        description: 'Тип упаковки (erofs или sparse)'
+        required: true
+        default: 'erofs'
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
     
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 1. Очистка места
-      - name: Ручная очистка места
+      - name: Очистка места и настройка окружения
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo apt-get clean
-          df -h
-
-      # 2. Установка Python 2 и зависимостей
-      - name: Установка окружения Python 2.7
-        run: |
-          sudo add-apt-repository universe
+          docker rmi `docker images -q`
+          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
           sudo apt-get update
-          sudo apt-get install -y python2 python2-dev liblzma-dev
+          sudo apt-get -y install python2 python2-dev python3 python3-pip git aria2 zip unzip tar brotli zstd openjdk-8-jdk android-sdk-libsparse-utils
+          # Установка симлинка для python2, так как старые скрипты требуют именно "python"
+          sudo ln -sf /usr/bin/python2 /usr/bin/python
+
+      - name: Скачивание SGSI Build Tool
+        run: |
+          git clone --recurse-submodules https://github.com/Xiaoxindada/SGSI-build-tool.git -b 12 workspace
+          sudo chmod -R 777 workspace
+          cd workspace
+          # Обновление зависимостей внутри тулзы, если они устарели
+          bash setup.sh || true
+
+      - name: Скачивание прошивки (ROM)
+        run: |
+          cd workspace
+          echo "Скачиваю прошивку..."
+          aria2c -x16 -s16 "${{ github.event.inputs.rom_url }}" -o firmware.zip
+
+      - name: Распаковка и Сборка SGSI
+        run: |
+          cd workspace
+          # Распаковка zip
+          unzip firmware.zip -d firmware_files
           
-          curl https://bootstrap.pypa.io/pip/2.7/get-pip.py --output get-pip.py
+          # Автопоиск payload.bin или system.new.dat.br
+          if [ -f "firmware_files/payload.bin" ]; then
+            echo "Обнаружен payload.bin, используем его."
+            mv firmware_files/payload.bin .
+          elif [ -f "firmware_files/system.new.dat.br" ]; then
+            echo "Обнаружен классический формат DAT.BR."
+          fi
+
+          # Запуск скрипта сборки
+          # --AB указывает тип разделов, ${{ github.event.inputs.android_version }} - версию
+          sudo ./make.sh --AB ${{ github.event.inputs.android_version }}
+
+      - name: 🛠 ПРИМЕНЕНИЕ ФИКСОВ (Advanced Patching)
+        run: |
+          cd workspace
+          echo "Монтируем образ для применения фиксов..."
+          
+          # Создаем точку монтирования
+          mkdir -p mount_point
+          
+          # Конвертируем s.img (sparse) в raw system.img, если нужно, или используем готовый
+          if [ -f "SGSI/system.img" ]; then
+             echo "Образ найден."
+          else
+             echo "Ошибка: Образ SGSI не был создан!" && exit 1
+          fi
+
+          # Монтируем
+          sudo mount -o loop,rw SGSI/system.img mount_point
+
+          echo ">>> 1. Удаление проблемных оверлеев (Anti-Bootloop)"
+          # Удаляем только оверлеи SystemUI и Settings, которые часто крашат систему на другом железе
+          sudo rm -rf mount_point/product/overlay/*MiuiSystemUI*
+          sudo rm -rf mount_point/product/overlay/*Settings*
+          # Удаляем оверлеи скругления углов, если они есть (часто мешают)
+          sudo rm -rf mount_point/product/overlay/*Rounded*
+
+          echo ">>> 2. Фиксы build.prop (Безопасность и Отладка)"
+          # Разрешаем отладку
+          sudo sed -i 's/ro.secure=1/ro.secure=0/' mount_point/system/build.prop
+          sudo sed -i 's/ro.debuggable=0/ro.debuggable=1/' mount_point/system/build.prop
+          sudo sed -i 's/ro.adb.secure=1/ro.adb.secure=0/' mount_point/system/build.prop
+          # Пытаемся отключить шифрование на уровне пропов (не всегда помогает без fstab, но полезно)
+          sudo echo "ro.crypto.state=unencrypted" | sudo tee -a mount_point/system/build.prop
+          sudo echo "ro.secure=0" | sudo tee -a mount_point/system/build.prop
+
+          echo ">>> 3. Удаление мусора (Debloat)"
+          # Удаляем демоны Xiaomi, которые могут вызывать перегрев на не-Xiaomi ядрах
+          sudo rm -f mount_point/system/bin/mi_thermald
+          sudo rm -f mount_point/vendor/bin/mi_thermald
+
+          echo ">>> 4. Внедрение кастомных патчей (если есть)"
+          # Если ты создал папку 'patches' в репозитории, содержимое скопируется в систему
+          if [ -d "../patches" ]; then
+             echo "Найдены пользовательские патчи, копируем..."
+             sudo cp -r ../patches/* mount_point/
+          fi
+          
+          # Исправление прав доступа (SELinux fix attempt)
+          sudo chmod 0600 mount_point/system/build.prop
+          
+          # Размонтирование
+          sudo umount mount_point
+          echo "Фиксы применены успешно."
+
+      - name: Упаковка в EROFS/Sparse
+        run: |
+          cd workspace
+          
+          if [ "${{ github.event.inputs.repack_type }}" == "erofs" ]; then
+            echo "Упаковка в EROFS..."
+            # Используем mkfs.erofs (обычно есть в build-tool или системе)
+            # Если в системе нет, качаем статичный бинарник (надежнее)
+            wget https://github.com/sekaiacg/erofs-utils/raw/main/mkfs.erofs -O mkfs.erofs
+            chmod +x mkfs.erofs
+            
+            # Создаем EROFS образ из папки (нам нужно снова смонтировать или использовать img2simg logic)
+            # Примечание: Простой путь - использовать утилиту тулзы, если она поддерживает репак
+            # Но для надежности упакуем system.img обратно через img2simg если выбран sparse, или mkfs.erofs
+            
+            # Поскольку мы модифицировали system.img (ext4 raw), нам нужно его сжать или конвертировать
+            ./mkfs.erofs -zlz4hc -C32768 system_erofs.img SGSI/system.img
+            mv system_erofs.img Final_SGSI.img
+          else
+            echo "Упаковка в Sparse Image (стандартный)..."
+            img2simg SGSI/system.img Final_SGSI.img
+          fi
+
+      - name: Загрузка в Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: workspace/Final_SGSI.img
+          name: HyperOS SGSI - ${{ github.event.inputs.android_version }}
+          tag_name: v${{ github.run_number }}
+          body: |
+            **Source ROM:** ${{ github.event.inputs.rom_url }}
+            **Android Version:** ${{ github.event.inputs.android_version }}
+            **Patches Applied:**
+            - Removed MiuiSystemUI/Settings Overlays
+            - Disabled ForceEncrypt flags (props)
+            - Enabled ADB & Debugging
+            - Removed mi_thermald
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}          curl https://bootstrap.pypa.io/pip/2.7/get-pip.py --output get-pip.py
           sudo python2 get-pip.py
           
           sudo python2 -m pip install protobuf==3.17.3 backports.lzma
